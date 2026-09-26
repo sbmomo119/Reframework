@@ -451,6 +451,14 @@ class ReEngine:
                     # to actually overlap — on a CPU-only box it degrades to
                     # a sequential split (still correct, no overlap).
                     mlp.enable_cpu_split()
+                # Three-way PCIe competition (traffic A): model the token
+                # hidden-state transfers to a remote GPU as in-flight bytes the
+                # lookahead's reserve() deducts from its window budget.
+                # RE_MOE_SHUTTLE_STEPS=0 (default) keeps the two-way baseline.
+                shuttle_steps = env.get_moe_shuttle_steps()
+                if shuttle_steps > 0 and mlp is not None and hasattr(mlp, "set_shuttle"):
+                    from reframework.moe.moe_layer import CpuShuttle
+                    mlp.set_shuttle(CpuShuttle(n_steps=shuttle_steps))
         # Attach per-layer expert similarity tables so a prefetch miss can be
         # served by a resident similar expert instead of a PCIe load.
         self._moe_substitutes = self._load_moe_sim_tables()

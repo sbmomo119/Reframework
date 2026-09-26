@@ -145,6 +145,14 @@ def get_moe_cpu_split() -> bool:
     return _get_bool("RE_MOE_CPU_SPLIT", False)
 
 
+def get_moe_shuttle_steps() -> int:
+    """How many decode steps a token-hidden-state transfer (traffic A) is
+    modeled as occupying the shared PCIe link. Drives the CpuShuttle mock's
+    per-transfer decay for the three-way competition accounting in
+    ``reserve()``; 0 disables the shuttle entirely (two-way baseline)."""
+    return _get_int("RE_MOE_SHUTTLE_STEPS", 0)
+
+
 # --- attention / graph ------------------------------------------------------
 def get_attention_backend() -> str:
     """sdpa (default, the only Pascal-capable backend) | sdpa_paged. FreeToken
@@ -181,6 +189,7 @@ __all__ = [
     "get_moe_prefill_overlap",
     "get_moe_cache_policy",
     "get_moe_cpu_split",
+    "get_moe_shuttle_steps",
     "get_attention_backend",
     "get_enable_cuda_graph",
     "get_host_cache_dir",

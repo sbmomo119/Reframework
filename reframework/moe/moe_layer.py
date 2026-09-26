@@ -21,7 +21,8 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -64,10 +65,12 @@ class CpuShuttle:
     models the *bandwidth* effect without any real transfer: ``send`` records
     the bytes that would be on the link, and ``inflight_bytes`` returns a
     monotonically-decreasing counter that decays over ``n_steps`` — i.e. a
-    token transfer issued at step ``t`` occupies the link for the next
-    ``n_steps`` steps (``inflight_bytes`` is read by ``reserve`` in the step
-    *after* the transfer, per the semantic-B ordering: the transfer is in
-    flight when ``reserve`` runs, then completes over the following steps).
+    token transfer issued at step ``t`` occupies the link for ``n_steps``
+    steps. ``inflight_bytes`` is read by ``reserve`` *after* the ``send`` in
+    the same step (the predictor's ``record_step`` runs in the step that
+    initiated the transfer, per the semantic-B ordering), so it sees the
+    current transfer in flight, then the transfer completes over the
+    following steps.
 
     It is the test path for the three-way-competition story and a stand-in
     until ``CudaShuttle`` lands. ``send`` returns a clone so the CPU-only
@@ -76,47 +79,54 @@ class CpuShuttle:
 
     def __init__(self, n_steps: int = 2) -> None:
         self.n_steps = max(1, int(n_steps))
-        self._inflight: float = 0.0
-        self._per_step: float = 0.0  # bytes/step of the transfer in flight
+        # One entry per in-flight transfer: (remaining_bytes, bytes_completed
+        # per step). Per-entry decay so overlapping transfers each complete in
+        # exactly ``n_steps`` steps regardless of when the others arrived.
+        self._transfers: Deque[Tuple[float, float]] = deque()
 
     def send(self, hidden: torch.Tensor, to: str = "") -> torch.Tensor:
         """Record the bytes of ``hidden`` heading to ``to``; return a clone.
 
-        A new transfer arriving advances the previous one by one step (the old
-        transfer completes one more step toward delivery), then the new bytes
-        are added to the in-flight total. ``to`` is unused on the mock (kept
-        for :class:`DeviceShuttle` signature parity).
+        First ages every transfer already on the link by one step (see
+        :meth:`advance_step`), then appends the new transfer at full size.
+        ``to`` is unused on the mock (kept for :class:`DeviceShuttle`
+        signature parity).
         """
         self.advance_step()
         if hidden is not None and hidden.numel() > 0:
-            self._inflight += float(hidden.numel() * hidden.element_size())
-            self._per_step = self._inflight / self.n_steps
+            b = float(hidden.numel() * hidden.element_size())
+            self._transfers.append((b, b / self.n_steps))
         return hidden.clone() if hidden is not None else hidden
 
     def advance_step(self) -> None:
-        """One decode step elapses: the in-flight transfer completes one step.
+        """One decode step elapses: every in-flight transfer completes one step.
 
-        ``inflight_bytes`` decays monotonically (clamped at 0) by ``_inflight /
-        n_steps`` each call, so a transfer issued at step ``t`` is fully
-        delivered after ``n_steps`` steps.
+        Each entry decays by its own ``bytes/n_steps`` (clamped at 0 and
+        dropped once fully delivered), so ``inflight_bytes`` is a sum of
+        monotonically-decreasing counters: a transfer issued at step ``t`` is
+        visible for exactly ``n_steps`` reads, then gone — independent of any
+        later transfers.
         """
-        if self._inflight > 0:
-            self._inflight = max(0.0, self._inflight - self._per_step)
+        kept: Deque[Tuple[float, float]] = deque()
+        for remaining, per in self._transfers:
+            r = remaining - per
+            if r > 0.0:
+                kept.append((r, per))
+        self._transfers = kept
 
     def inflight_bytes(self) -> float:
         """Bytes currently occupying the link (traffic A) — read-only.
 
         This is the value :meth:`ExpertOffloadCache.reserve` subtracts from its
         window budget. Pure read: the decay is driven by :meth:`advance_step`
-        (called from ``record_step`` on each decode step), not here, so the
-        reader never perturbs the counter.
+        (called on each ``send``), not here, so the reader never perturbs the
+        counters.
         """
-        return self._inflight
+        return float(sum(r for r, _ in self._transfers))
 
     def sync(self) -> None:
-        """Force all in-flight transfers to complete (drain the counter)."""
-        self._inflight = 0.0
-        self._per_step = 0.0
+        """Force all in-flight transfers to complete (drain the counters)."""
+        self._transfers.clear()
 
 
 class FusedMoE(BaseOP):
@@ -598,11 +608,19 @@ class FusedMoE(BaseOP):
 
         # ---- lookahead: record this step's routed set after the split, so
         # the predictor's next-step reserve sees the current set as resident.
+        # The shuttle's in-flight token bytes (traffic A) are passed through so
+        # reserve() deducts them from its window budget — the three-way
+        # competition (semantic B: the transfer was initiated by the send above
+        # and is still on the link when reserve runs this step).
         if self._predictor is not None:
             self._predictor.record_step(
                 topk_ids.reshape(-1).tolist(),
                 is_prefill=(x2.shape[0] > 1),
                 forward_ms=self._since_last_step_ms(),
+                inflight_bytes=(
+                    self._shuttle.inflight_bytes()
+                    if self._shuttle is not None else 0.0
+                ),
             )
 
         del w1, w2, w1q, w2q, topk_gpu, topk_cpu
@@ -642,4 +660,4 @@ class FusedMoE(BaseOP):
                         param.copy_(state_dict[key].detach().to(dtype=self.dtype))
 
 
-__all__ = ["FusedMoE"]
+__all__ = ["FusedMoE", "CpuShuttle"]
