@@ -1,0 +1,55 @@
+"""Layer base classes.
+
+FreeToken defines ``BaseOP`` / ``StateLessOP`` with ``state_dict`` /
+``load_state_dict`` overrides that strip device- and dtype-specific storage. Re
+keeps the same two-class split but the (de)serialisation is plain — there is no
+quant-method indirection on Pascal (no fp8/marlin/nvfp4 backends to swap in).
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+import torch
+import torch.nn as nn
+
+
+class BaseOP(nn.Module):
+    """An operator that owns parameters (weights)."""
+
+    def _load_state_dict_raw(self, state_dict: Dict[str, torch.Tensor], prefix: str) -> None:
+        # load into a temp on CPU then move, to avoid cross-device dtype surprises
+        own = self.state_dict(prefix=prefix)
+        with torch.no_grad():
+            for key, value in own.items():
+                if key in state_dict:
+                    loaded = state_dict[key]
+                    # cast to the parameter's dtype/device (handles fp32<->fp16 storage);
+                    # detach the incoming so we never copy_ into a leaf that requires grad
+                    value.copy_(loaded.detach().to(device=value.device, dtype=value.dtype))
+
+    def load_state_dict(
+        self, state_dict: Dict[str, torch.Tensor], *, prefix: str = ""
+    ) -> None:
+        self._load_state_dict_raw(state_dict, prefix)
+
+    def state_dict(self, *, prefix: str = "", result: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+        result = {} if result is None else result
+        for name, param in self.named_parameters():
+            result[f"{prefix}.{name}" if prefix else name] = param
+        return result
+
+
+class StateLessOP(nn.Module):
+    """An operator with no learnable parameters (e.g. RoPE, rotary caches)."""
+
+    def load_state_dict(
+        self, state_dict: Dict[str, torch.Tensor], *, prefix: str = ""
+    ) -> None:  # nothing to load
+        return None
+
+    def state_dict(self, *, prefix: str = "", result: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+        return {} if result is None else result
+
+
+__all__ = ["BaseOP", "StateLessOP"]

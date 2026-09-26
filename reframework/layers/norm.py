@@ -1,0 +1,56 @@
+"""RMSNorm — pure PyTorch, fp32-accumulated.
+
+FreeToken dispatches to a flashinfer or triton kernel. On Pascal there is no
+such kernel that is both fast *and* portable, so Re computes the norm in fp32
+regardless of the storage dtype (this matches HF numerics for Qwen/Llama):
+``x / rms(x) * weight`` where ``rms(x) = sqrt(mean(x^2) + eps)``.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .base import BaseOP
+
+
+class RMSNorm(BaseOP):
+    def __init__(self, size: int, eps: float, bias: bool = False) -> None:
+        super().__init__()
+        self.eps = eps
+        self.size = size
+        self.weight = nn.Parameter(torch.ones(size))
+        # PhiMoE-style LayerNorm has a bias; Qwen3/Llama/OLMoE do not.
+        self.bias = nn.Parameter(torch.zeros(size)) if bias else None
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x32 = x.to(torch.float32)
+        norm = x32.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt().reciprocal()
+        out = x32 * norm
+        # scale back to storage dtype; compute the multiply in fp32 first
+        out = out * self.weight.to(torch.float32)
+        if self.bias is not None:
+            out = out + self.bias.to(torch.float32)
+        return out.to(orig_dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward(x)
+
+    def forward_inplace(self, x: torch.Tensor) -> None:
+        x.copy_(self._forward(x))
+
+    def forward_add_residual(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Fused ``residual = x + residual; x = rmsnorm(residual)``.
+
+        Returns (normed, new_residual). This is the standard LLM decoder block
+        layout (Qwen2/3, Llama): attention and MLP both consume the normed x and
+        add back into the residual stream.
+        """
+        residual = x + residual
+        return self._forward(residual), residual
+
+
+__all__ = ["RMSNorm"]

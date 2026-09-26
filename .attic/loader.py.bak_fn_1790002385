@@ -1,0 +1,166 @@
+"""HF safetensors checkpoint loading (config.json + sharded weights).
+
+Minimal and Pascal-safe: reads ``config.json`` + ``*.safetensors`` (single
+file or ``model.safetensors.index.json`` shards), builds the model from the
+config, and loads the weights through the model's HF-style
+``load_state_dict`` (which casts into the model dtype). No raw CUDA, no
+custom kernels — plain ``safetensors.torch.load_file`` on CPU, then one
+``.to(device)``-friendly model build.
+
+Typical use::
+
+    model, report = load_model("/models/Llama-3-8B",
+                               dtype=torch.float32, device="cuda:0")
+"""
+from __future__ import annotations
+
+from reframework.models.olmoe import build_olmoe
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+
+from reframework.models.base import LlamaModel
+from reframework.models.config import ModelConfig
+from reframework.models.qwen3 import build_qwen3
+from reframework.utils import init_logger
+
+logger = init_logger(__name__)
+
+_WEIGHT_INDEX = "model.safetensors.index.json"
+_SINGLE = "model.safetensors"
+
+
+def load_config(ckpt_dir: Union[str, Path]) -> dict:
+    """Read the HF ``config.json`` from a checkpoint directory."""
+    p = Path(ckpt_dir) / "config.json"
+    if not p.exists():
+        raise FileNotFoundError(f"missing config.json in {p.parent}")
+    return json.loads(p.read_text())
+
+
+def resolve_weight_files(ckpt_dir: Union[str, Path]) -> List[Path]:
+    """Ordered safetensors file list (index.json shards, else single, else glob)."""
+    root = Path(ckpt_dir)
+    index = root / _WEIGHT_INDEX
+    if index.exists():
+        data = json.loads(index.read_text())
+        files = sorted(set(data["weight_map"].values()))
+        missing = [f for f in files if not (root / f).exists()]
+        if missing:
+            raise FileNotFoundError(f"index references missing files: {missing}")
+        return [root / f for f in files]
+    single = root / _SINGLE
+    if single.exists():
+        return [single]
+    files = sorted(root.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"no safetensors weights found under {root}")
+    return files
+
+
+@dataclass
+class LoadReport:
+    """What the loader found / skipped."""
+
+    ckpt_dir: str
+    files: List[str]
+    tensors_loaded: int
+    missing: List[str] = field(default_factory=list)    # expected, not in checkpoint
+    unexpected: List[str] = field(default_factory=list)  # in checkpoint, unused
+
+    def summary(self) -> str:
+        return (
+            f"loaded {self.tensors_loaded} tensors from {len(self.files)} file(s); "
+            f"missing={len(self.missing)} unexpected={len(self.unexpected)}"
+        )
+
+
+def build_model(
+    cfg_json: dict,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cpu",
+) -> nn.Module:
+    """Build the Re model from a raw HF config dict (dispatch on ``architectures``)."""
+    arch = str(cfg_json.get("architectures", [""])[0]).lower()
+    if arch.startswith("qwen3"):
+        return build_qwen3(cfg_json, dtype=dtype, device=device)
+    if arch.startswith("olmoe") or arch.startswith("olmoe"):
+        return build_olmoe(cfg_json, dtype=dtype, device=device)
+    # Llama 3 / Llama 2 / other Llama-shaped dense models share the base model.
+    return LlamaModel(ModelConfig.from_hf(cfg_json, dtype=dtype, device=device))
+
+
+def load_weights(ckpt_dir: Union[str, Path]) -> Dict[str, torch.Tensor]:
+    """Load every tensor from every safetensors file (kept on CPU)."""
+    from safetensors.torch import load_file  # local: keeps the module import light
+
+    sd: Dict[str, torch.Tensor] = {}
+    for f in resolve_weight_files(ckpt_dir):
+        sd.update(load_file(str(f), device="cpu"))
+    return sd
+
+
+def load_model(
+    ckpt_dir: Union[str, Path],
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: str = "cpu",
+) -> Tuple[nn.Module, LoadReport]:
+    """Build the model from ``config.json`` and load the safetensors weights.
+
+    Weights are read on CPU; the model's ``load_state_dict`` casts them into
+    the model dtype. The report lists expected-but-missing keys (a tied
+    ``lm_head`` is expected on tied models) and checkpoint keys we don't use.
+    """
+    root = Path(ckpt_dir)
+    cfg_json = load_config(root)
+    model = build_model(cfg_json, dtype=dtype or torch.float32, device=device)
+
+    sd = load_weights(root)
+
+    # PhiMoE: translate HF key names -> reframework's mlp/experts naming.
+    if str(cfg_json.get("architectures", [""])[0]).lower().startswith("phimoe"):
+        sd = _translate_phimoe_keys(sd)
+
+    expected = set(model.state_dict().keys())
+    got = set(sd.keys())
+    missing = sorted(expected - got)
+    unexpected = sorted(got - expected)
+
+    # Tied models (e.g. Llama 3 8B) don't ship separate lm_head weights — the
+    # head reuses the embedding matrix — so those "missing" keys are expected.
+    if cfg_json.get("tie_word_embeddings", False):
+        missing = [k for k in missing if not k.startswith("lm_head.")]
+
+    model.load_state_dict(sd)
+    model.eval()
+
+    report = LoadReport(
+        ckpt_dir=str(root),
+        files=[str(f) for f in resolve_weight_files(root)],
+        tensors_loaded=len(got & expected),
+        missing=missing,
+        unexpected=unexpected,
+    )
+    logger.info("%s", report.summary())
+    if missing:
+        logger.warning("missing keys (first 8): %s", missing[:8])
+    if unexpected:
+        logger.info("unused checkpoint keys (first 8): %s", unexpected[:8])
+    return model, report
+
+
+__all__ = [
+    "LoadReport",
+    "build_model",
+    "load_config",
+    "load_model",
+    "load_weights",
+    "resolve_weight_files",
+]

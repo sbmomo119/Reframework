@@ -1,0 +1,208 @@
+"""Interactive chat REPL over the Re engine.
+
+Pipes a checkpoint dir + tokenizer through :func:`build_engine` and runs a
+single-stream conversation loop. The only hard dependency beyond torch is
+``transformers`` (for the tokenizer), loaded lazily so ``import reframework.cli``
+stays cheap.
+
+Usage::
+
+    python -m reframework.cli.chat /path/to/ckpt \
+        --max-tokens 128 --temperature 0.0 [--device cpu] [--no-stream]
+    echo "hello" | python -m reframework.cli.chat /path/to/ckpt --once
+
+Constraints honoured: fp32 only, CUDA graph off, single-stream. The REPL is a
+thin driver over ``engine.generate``; no batching, no scheduler.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from typing import List, Optional
+
+from reframework.core import SamplingParams
+from reframework.engine import build_engine, EngineConfig
+from reframework.tokenizer import Tokenizer
+from reframework.utils.logging import init_logger
+
+logger = init_logger(__name__)
+
+__all__ = ["build_chat_session", "run_repl", "main"]
+
+
+# --------------------------------------------------------------------- helpers
+def build_chat_session(model_path, device, max_seq_len, *,
+                       lora_path=None, pp_size=1, ep_size=1,
+                       rank=0, world_size=1,
+                       master_addr="127.0.0.1", master_port=29500) -> tuple:
+    """Load tokenizer + checkpoint, return ``(engine, tokenizer)``.
+
+    The tokenizer is handed to :func:`build_engine` so EOS enforcement uses the
+    model's real EOS id.
+    """
+    tok = Tokenizer(model_path)
+    ecfg = EngineConfig(
+        device=device, max_seq_len=max_seq_len,
+        lora_path=lora_path, pp_size=pp_size, ep_size=ep_size,
+        rank=rank, world_size=world_size,
+        master_addr=master_addr, master_port=master_port,
+    )
+    eng = build_engine(model_path, tokenizer=tok, cfg=ecfg)
+    return eng, tok
+
+
+def _sample_params(args: argparse.Namespace) -> SamplingParams:
+    return SamplingParams(
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        max_new_tokens=args.max_tokens,
+        seed=args.seed,
+    )
+
+
+def _strip_bos(ids: List[int], tok: Tokenizer) -> List[int]:
+    bos = getattr(tok, "bos_token_id", None)
+    while ids and bos is not None and ids[0] == bos:
+        ids = ids[1:]
+    return ids
+
+
+# --------------------------------------------------------------- conversation
+def run_once(
+    engine,
+    tok: Tokenizer,
+    messages: List[dict],
+    sp: SamplingParams,
+    stream: bool = True,
+) -> str:
+    """Run one assistant turn: apply the chat template, generate, print.
+
+    ``messages`` must already end with the user turn. Returns the assistant
+    text (which the caller should append to ``messages``). With ``stream`` the
+    decoded tokens are printed as they arrive; otherwise the answer prints once
+    at the end.
+    """
+    prompt = tok.apply_chat_template(messages, add_generation_prompt=True)
+    prompt_ids = _strip_bos(tok.encode(prompt, add_special_tokens=False), tok)
+    if not prompt_ids:
+        return ""
+
+    t0 = time.time()
+    if stream:
+        gen_buf: List[int] = []
+
+        def on_token(t: int) -> None:
+            gen_buf.append(t)
+            sys.stdout.write(tok.decode(gen_buf, skip_special_tokens=True))
+            sys.stdout.flush()
+
+        out_ids = engine.generate(prompt_ids, sp, on_token=on_token)
+        text = tok.decode(out_ids, skip_special_tokens=True)
+    else:
+        out_ids = engine.generate(prompt_ids, sp)
+        text = tok.decode(out_ids, skip_special_tokens=True)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    dt = time.time() - t0
+    logger.debug("turn: %d in, %d out in %.2fs", len(prompt_ids), len(out_ids), dt)
+    return text
+
+
+# ----------------------------------------------------------------------- REPL
+def run_repl(engine, tok: Tokenizer, args: argparse.Namespace) -> None:
+    sp = _sample_params(args)
+    messages: List[dict] = []
+    stream = not args.no_stream
+
+    sys.stderr.write(
+        f"[re] engine ready on {engine.device}; type a message, `/exit` to quit, "
+        f"`/reset` to clear history\n"
+    )
+    while True:
+        try:
+            line = input("[you] > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.stderr.write("\n[re] bye\n")
+            return
+        if not line:
+            continue
+        if line in ("/exit", "/quit", "/q"):
+            sys.stderr.write("[re] bye\n")
+            return
+        if line == "/reset":
+            messages = []
+            sys.stderr.write("[re] history cleared\n")
+            continue
+        if line.startswith("/"):
+            sys.stderr.write(f"[re] unknown command {line!r}\n")
+            continue
+
+        messages.append({"role": "user", "content": line})
+        text = run_once(engine, tok, messages, sp, stream=stream)
+        sys.stdout.write("\n")
+        messages.append({"role": "assistant", "content": text})
+
+
+# ------------------------------------------------------------------------ CLI
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Re interactive chat (single-stream, fp32)")
+    p.add_argument("model", help="path to a HF checkpoint dir (config.json + weights + tokenizer)")
+    p.add_argument("--device", default="auto", help="auto|cpu|cuda (default auto)")
+    p.add_argument("--max-tokens", type=int, default=128, help="max new tokens per turn")
+    p.add_argument("--temperature", type=float, default=0.0, help="0 = greedy")
+    p.add_argument("--top-k", type=int, default=1)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--max-seq-len", type=int, default=4096)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--no-stream", action="store_true", help="print the whole answer at once")
+    p.add_argument("--once", action="store_true", help="run a single turn (prompt from stdin) then exit")
+    p.add_argument("--lora", default=None, help="LoRA adapter path")
+    p.add_argument("--pp-size", type=int, default=1, help="Pipeline parallel size")
+    p.add_argument("--ep-size", type=int, default=1, help="Expert parallel size")
+    p.add_argument("--rank", type=int, default=0, help="Global rank")
+    p.add_argument("--world-size", type=int, default=1, help="World size")
+    p.add_argument("--master-addr", default="127.0.0.1")
+    p.add_argument("--master-port", type=int, default=29500)
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    engine, tok = build_chat_session(
+        args.model, args.device, args.max_seq_len,
+        lora_path=getattr(args, "lora", None),
+        pp_size=getattr(args, "pp_size", 1),
+        ep_size=getattr(args, "ep_size", 1),
+        rank=getattr(args, "rank", 0),
+        world_size=getattr(args, "world_size", 1),
+        master_addr=getattr(args, "master_addr", "127.0.0.1"),
+        master_port=getattr(args, "master_port", 29500),
+    ),
+        pp_size=getattr(args, "pp_size", 1),
+        ep_size=getattr(args, "ep_size", 1),
+        rank=getattr(args, "rank", 0),
+        world_size=getattr(args, "world_size", 1),
+        master_addr=getattr(args, "master_addr", "127.0.0.1"),
+        master_port=getattr(args, "master_port", 29500),
+    )
+    try:
+        if args.once:
+            prompt = sys.stdin.read().strip()
+            if not prompt:
+                sys.stderr.write("[re] no prompt on stdin\n")
+                return 1
+            sp = _sample_params(args)
+            text = run_once(engine, tok, [{"role": "user", "content": prompt}], sp, stream=not args.no_stream)
+            sys.stdout.write("\n")
+            return 0
+        run_repl(engine, tok, args)
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

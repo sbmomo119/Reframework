@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reframework"
+version = "0.1.0"
+description = "Re — a lean, sm_61 (NVIDIA Pascal)-aware LLM inference framework"
+readme = { text = "Re: a lean, Pascal-aware LLM inference engine (fp32, SDPA attention, host-offloaded MoE).", content-type = "text/plain" }
+requires-python = ">=3.10"
+authors = [{ name = "Re" }]
+license = { text = "MIT" }
+keywords = ["llm", "inference", "pascal", "sm61", "moe", "kv-cache"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+]
+# Core runtime: torch is required for the whole stack; safetensors loads the
+# checkpoint; transformers backs the tokenizer. All three are imported lazily
+# inside functions (to keep `import reframework` cheap) but are required to
+# actually build an engine, so they are hard dependencies.
+dependencies = [
+    "torch>=2.0",
+    "safetensors>=0.4",
+    "transformers>=4.30",
+]
+
+[project.optional-dependencies]
+# OpenAI-compatible HTTP server (FastAPI + uvicorn).
+server = ["fastapi>=0.100", "uvicorn[standard]>=0.23"]
+# Convenience: everything a full deployment needs.
+all = ["reframework[server]"]
+
+[project.scripts]
+# Console entry points so the package is usable from any directory once
+# `pip install -e .` (or a plain install) has run.
+re-chat = "reframework.cli.chat:main"
+re-server = "reframework.server.app:main"
+
+[tool.setuptools]
+# Discover the package + every subpackage (all have __init__.py).
+[tool.setuptools.packages.find]
+include = ["reframework*"]

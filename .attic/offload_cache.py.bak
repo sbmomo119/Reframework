@@ -1,0 +1,230 @@
+"""Host-offload LRU expert cache — the core of the small-VRAM (1070ti) story.
+
+A Qwen3-30B-A3B / Llama-3.1-8B-MoE class model has 128-256 experts whose weights
+totally exceed 6-8 GB. FreeToken solves this with a pinned-host expert pool:
+all experts live in RAM (pinned for zero-copy HtoD), and only a small LRU window
+is resident in VRAM. Before a step the engine prefetches the experts that the
+current token batch will route to, so the forward pass never stalls on PCIe.
+
+Re mirrors that, in plain torch:
+
+  * ``load``      — take per-expert weights (HF naming) and stage them in pinned
+                    host memory.
+  * ``prefetch``  — bring a set of experts into the VRAM LRU (evicting LRU),
+                    return their packed banks ``[N,2I,H]``/``[N,H,I]`` for
+                    :func:`reframework.moe.fused.fused_experts`, plus the
+                    global->local index map that function needs.
+
+The host pool is a single contiguous *pinned* buffer (guarded: if the build has
+no CUDA/pin support — e.g. a CPU-only dev box — it falls back to page-able
+host memory). Each expert's slice is a view into that buffer, so the HtoD copy
+on the 1070ti is a true async DMA instead of a synchronous staged copy.
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+from reframework.utils import init_logger
+
+logger = init_logger(__name__)
+
+
+@dataclass
+class OffloadStats:
+    """Counters for observability / benchmarking."""
+
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    transfers_bytes: int = 0
+
+    def reset(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.transfers_bytes = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+            "transfer_mb": self.transfers_bytes / (1024 * 1024),
+        }
+
+
+@dataclass
+class ExpertOffloadCache:
+    """Pinned-host expert pool + a small VRAM LRU window.
+
+    Parameters
+    ----------
+    device:
+        VRAM device the LRU lives on (``cuda:0`` on the 1070ti, ``cpu`` for a
+        test where "VRAM" is just host memory).
+    lru_capacity:
+        Max number of expert *slots* (one slot = one expert's w1+w2) kept in
+        VRAM. Sized by the engine from the VRAM budget.
+    dtype:
+        Compute dtype of the resident experts (fp16 storage / fp32 compute is
+        handled downstream in ``fused_experts``).
+    """
+
+    device: torch.device
+    lru_capacity: int
+    dtype: torch.dtype = torch.float16
+    _host: List[Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list, repr=False)
+    _host_buf: Optional[torch.Tensor] = field(default=None, repr=False)
+    _pinned: bool = field(default=False, repr=False)
+    _lru: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor]]" = field(
+        default_factory=OrderedDict, repr=False
+    )
+    stats: OffloadStats = field(default_factory=OffloadStats, repr=False)
+
+    # ----------------------------------------------------------------- factory
+
+    @classmethod
+    def from_config(cls, cfg, *, device=None, lru_capacity: Optional[int] = None) -> "ExpertOffloadCache":
+        """Build from a ``reframework.models.ModelConfig``.
+
+        ``device`` defaults to the config's device; ``lru_capacity`` defaults
+        to the env override (``RE_MOE_CACHE_SIZE``) or 0 = auto, which the
+        engine resolves against the free-VRAM budget via
+        :meth:`ModelConfig.size_moe_lru` before the first step.
+        """
+        import torch  # local: keep this module importable on meta-init paths
+        from reframework import env
+
+        return cls(
+            device=torch.device(device or cfg.device),
+            lru_capacity=lru_capacity if lru_capacity is not None else env.get_moe_cache_size(),
+            dtype=cfg.dtype,
+        )
+
+    # ------------------------------------------------------------------ setup
+
+    def load(
+        self,
+        experts: Sequence[Dict[str, torch.Tensor]],
+    ) -> None:
+        """Stage per-expert weights into (pinned) host memory.
+
+        ``experts[i]`` maps ``"w1" -> [2I,H]`` and ``"w2" -> [H,I]``. The caller
+        (``moe_layer.build_offload_cache``) is responsible for the HF->bank
+        naming; here we only pin and convert dtype.
+        """
+        w1s = [e["w1"].to(dtype=self.dtype).contiguous() for e in experts]
+        w2s = [e["w2"].to(dtype=self.dtype).contiguous() for e in experts]
+        n1 = sum(w.numel() for w in w1s)
+        n2 = sum(w.numel() for w in w2s)
+
+        # One contiguous host pool so the HtoD copy is a single DMA-able region.
+        # pin_memory() needs a CUDA build; on a CPU-only dev box it raises, so
+        # fall back to page-able memory (correct, just synchronous copies).
+        try:
+            buf = torch.empty(n1 + n2, dtype=self.dtype).pin_memory()
+            self._pinned = True
+        except (RuntimeError, AssertionError):
+            buf = torch.empty(n1 + n2, dtype=self.dtype)
+            self._pinned = False
+        self._host_buf = buf
+
+        off = 0
+        self._host = []
+        for w1, w2 in zip(w1s, w2s):
+            v1 = buf[off : off + w1.numel()].view_as(w1)
+            v1.copy_(w1)
+            off += w1.numel()
+            v2 = buf[off : off + w2.numel()].view_as(w2)
+            v2.copy_(w2)
+            off += w2.numel()
+            self._host.append((v1, v2))
+        del w1s, w2s
+        self._lru = OrderedDict()
+        self.stats.reset()
+        logger.info(
+            "ExpertOffloadCache staged %d experts (%s) in %s host pool; LRU cap=%d",
+            len(self._host), self.dtype, "pinned" if self._pinned else "pageable",
+            self.lru_capacity,
+        )
+
+    @property
+    def num_experts(self) -> int:
+        return len(self._host)
+
+    def reset_lru(self) -> None:
+        """Drop all resident experts (call at the start of a sequence)."""
+        self._lru = OrderedDict()
+
+    # ------------------------------------------------------------------ access
+
+    def prefetch(self, indices: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, int]]:
+        """Bring ``indices`` into the VRAM LRU and return their packed banks.
+
+        Returns ``(w1, w2, local_index)`` where ``w1`` is ``[N,2I,H]``, ``w2``
+        is ``[N,H,I]`` (N = len of the unique indices, in ascending order) and
+        ``local_index`` maps each *global* expert id to its row ``0..N-1`` in
+        the packed banks — exactly what ``fused_experts`` needs to group tokens.
+        """
+        uniq = sorted(set(int(i) for i in indices))
+        for idx in uniq:
+            if idx not in self._lru:
+                self._fill(idx)
+            else:
+                self.stats.hits += 1
+            self._lru.move_to_end(idx)  # mark most-recently used
+        self._evict(uniq)  # trim down to capacity, protecting this step's set
+        return self._pack(uniq)
+
+    def _fill(self, idx: int) -> None:
+        w1, w2 = self._host[idx]
+        # host -> VRAM; count the *bytes* moved (numel * element_size)
+        w1v = w1.to(device=self.device, non_blocking=self._pinned)
+        w2v = w2.to(device=self.device, non_blocking=self._pinned)
+        self.stats.transfers_bytes += (w1.numel() + w2.numel()) * self.dtype.itemsize
+        self.stats.misses += 1
+        self._lru[idx] = (w1v, w2v)
+
+    def _evict(self, protect: Sequence[int]) -> None:
+        """Evict least-recently-used experts down to ``lru_capacity``.
+
+        Experts in ``protect`` (this step's routed set) are never evicted, so
+        ``_pack`` can always find them. Eviction runs only after the whole
+        step's set is resident — evicting mid-fill would drop a just-loaded
+        expert from the very set we're about to pack (KeyError).
+        """
+        protect = set(protect)
+        while len(self._lru) > self.lru_capacity:
+            old_idx = next(iter(self._lru))  # LRU end
+            if old_idx in protect:
+                return  # nothing evictable without breaking this step
+            (ow1, ow2) = self._lru.pop(old_idx)
+            del ow1, ow2  # frees the VRAM tensors
+            self.stats.evictions += 1
+
+    def _pack(
+        self, uniq: Sequence[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, int]]:
+        local_index = {idx: k for k, idx in enumerate(uniq)}
+        # stack (not cat): each resident expert is [2I,H] / [H,I]; stacking adds
+        # the leading batch dim -> [N,2I,H] / [N,H,I] that fused_experts expects.
+        w1 = torch.stack([self._lru[i][0] for i in uniq], dim=0)  # [N,2I,H]
+        w2 = torch.stack([self._lru[i][1] for i in uniq], dim=0)  # [N,H,I]
+        return w1, w2, local_index
+
+    # ------------------------------------------------------------------ stats
+
+    def report(self) -> str:
+        s = self.stats.as_dict()
+        return (
+            f"offload: hit={s['hits']} miss={s['misses']} "
+            f"evict={s['evictions']} transfer={s['transfer_mb']:.1f}MB"
+        )
+
+
+__all__ = ["ExpertOffloadCache", "OffloadStats"]

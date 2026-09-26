@@ -1,0 +1,17 @@
+model:
+  path: /home/samuel/huihui-ai--Huihui-MoE-1.2B-A0.6B/snapshots/master
+  tokenizer: /home/samuel/huihui-ai--Huihui-MoE-1.2B-A0.6B/snapshots/master
+compute:
+  dtype: fp16
+  device: cpu
+cache:
+  strategy: lru
+  max_experts: 84
+  predict_window: 32
+metrics:
+  log_activations: true
+  activations_file: data/activation_logs/huihui.jsonl
+  print_per_step: true
+prompt: "The capital of France is"
+max_new_tokens: 8
+seed: 42

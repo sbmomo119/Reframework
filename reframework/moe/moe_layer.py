@@ -1,0 +1,645 @@
+"""Fused MoE layer (gate + routed experts, Pascal-safe, offload-aware).
+
+FreeToken's MoE is a triton fused_moe + fused_topk pair. Re does the routing
+with ``torch_fused_topk`` and the expert compute with ``fused_experts`` (plain
+cuBLAS), both in :mod:`reframework.moe.fused`. The only thing this layer adds
+on top is *where the expert weights live*:
+
+  * **resident** — small models where all experts fit in VRAM; the per-expert
+    ``nn.Parameter`` tensors are used directly.
+  * **offload**  — big MoE models that don't fit; the weights are staged in a
+    pinned-host :class:`ExpertOffloadCache` and prefetched per step. This is
+    the mode that makes a 30B-A3B-class MoE run on a 6-8 GB 1070ti.
+
+The forward path is identical in both modes after a single branch: build the
+packed expert banks, remap the routed ids to the bank's local rows, and call
+``fused_experts``.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import threading
+import time
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+
+from reframework.layers.base import BaseOP
+from reframework.moe.fused import (
+    fused_experts,
+    fused_experts_cpu_int8,
+    fused_experts_masked,
+    torch_fused_topk,
+)
+from reframework.moe.offload_cache import ExpertOffloadCache, Prediction
+
+# Shared single-worker pool for the CPU half of the CPU/GPU expert split
+# (RE_MOE_CPU_SPLIT). One worker across all MoE layers: forward is sequential
+# layer-by-layer, so a single FIFO worker is both correct and avoids
+# oversubscribing the CPU cores the int8 GEMMs already saturate.
+_CPU_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_CPU_EXECUTOR_LOCK = threading.Lock()
+
+
+def _cpu_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _CPU_EXECUTOR
+    if _CPU_EXECUTOR is None:
+        with _CPU_EXECUTOR_LOCK:
+            if _CPU_EXECUTOR is None:
+                _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="moe-cpu-experts"
+                )
+    return _CPU_EXECUTOR
+
+
+class CpuShuttle:
+    """Mock :class:`DeviceShuttle` for the three-way PCIe competition.
+
+    The real ``DeviceShuttle`` (see ``coplace.shuttle``) moves token
+    hidden-states between GPU0 and GPU1 over a shared PCIe link (traffic A) and
+    reports how many bytes are still in flight so :meth:`ExpertOffloadCache.
+    reserve` can deduct them from the lookahead's window budget. This CPU mock
+    models the *bandwidth* effect without any real transfer: ``send`` records
+    the bytes that would be on the link, and ``inflight_bytes`` returns a
+    monotonically-decreasing counter that decays over ``n_steps`` — i.e. a
+    token transfer issued at step ``t`` occupies the link for the next
+    ``n_steps`` steps (``inflight_bytes`` is read by ``reserve`` in the step
+    *after* the transfer, per the semantic-B ordering: the transfer is in
+    flight when ``reserve`` runs, then completes over the following steps).
+
+    It is the test path for the three-way-competition story and a stand-in
+    until ``CudaShuttle`` lands. ``send`` returns a clone so the CPU-only
+    forward path stays correct; only the byte accounting matters here.
+    """
+
+    def __init__(self, n_steps: int = 2) -> None:
+        self.n_steps = max(1, int(n_steps))
+        self._inflight: float = 0.0
+        self._per_step: float = 0.0  # bytes/step of the transfer in flight
+
+    def send(self, hidden: torch.Tensor, to: str = "") -> torch.Tensor:
+        """Record the bytes of ``hidden`` heading to ``to``; return a clone.
+
+        A new transfer arriving advances the previous one by one step (the old
+        transfer completes one more step toward delivery), then the new bytes
+        are added to the in-flight total. ``to`` is unused on the mock (kept
+        for :class:`DeviceShuttle` signature parity).
+        """
+        self.advance_step()
+        if hidden is not None and hidden.numel() > 0:
+            self._inflight += float(hidden.numel() * hidden.element_size())
+            self._per_step = self._inflight / self.n_steps
+        return hidden.clone() if hidden is not None else hidden
+
+    def advance_step(self) -> None:
+        """One decode step elapses: the in-flight transfer completes one step.
+
+        ``inflight_bytes`` decays monotonically (clamped at 0) by ``_inflight /
+        n_steps`` each call, so a transfer issued at step ``t`` is fully
+        delivered after ``n_steps`` steps.
+        """
+        if self._inflight > 0:
+            self._inflight = max(0.0, self._inflight - self._per_step)
+
+    def inflight_bytes(self) -> float:
+        """Bytes currently occupying the link (traffic A) — read-only.
+
+        This is the value :meth:`ExpertOffloadCache.reserve` subtracts from its
+        window budget. Pure read: the decay is driven by :meth:`advance_step`
+        (called from ``record_step`` on each decode step), not here, so the
+        reader never perturbs the counter.
+        """
+        return self._inflight
+
+    def sync(self) -> None:
+        """Force all in-flight transfers to complete (drain the counter)."""
+        self._inflight = 0.0
+        self._per_step = 0.0
+
+
+class FusedMoE(BaseOP):
+    """A routed MoE block: ``gate`` (Linear) -> top-k -> per-expert GEMMs."""
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: str = "silu",
+        renormalize: bool = True,
+        dtype: torch.dtype = torch.float16,
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.activation = activation
+        self.renormalize = renormalize
+        self.dtype = dtype
+
+        # gate: a Linear(H -> E), weight is [E, H] (out, in). F.linear does x @ W^T -> [M, E].
+        # HF names this `gate.weight` with exactly that [num_experts, hidden] shape.
+        self.gate = torch.nn.Parameter(torch.empty(num_experts, hidden_size, dtype=dtype))
+
+        # per-expert weights, HF naming. [2I,H] gate|up and [H,I] down.
+        # nn.ParameterList (NOT a plain list) so nn.Module actually registers them:
+        # parameters()/.to(device)/state_dict() must see all 2E experts, otherwise
+        # on a real 1070ti they'd silently stay on the CPU.
+        self.experts_w1 = torch.nn.ParameterList([
+            torch.nn.Parameter(torch.empty(2 * intermediate_size, hidden_size, dtype=dtype))
+            for _ in range(num_experts)
+        ])
+        self.experts_w2 = torch.nn.ParameterList([
+            torch.nn.Parameter(torch.empty(hidden_size, intermediate_size, dtype=dtype))
+            for _ in range(num_experts)
+        ])
+
+        self._cache: Optional[ExpertOffloadCache] = None
+        # CPU/GPU parallel expert split (RE_MOE_CPU_SPLIT): when True and the
+        # offload cache is armed, forward dispatches the routed set by LRU
+        # residency — resident experts computed on the GPU, the rest computed
+        # on the CPU against the int8 host bank, then the two halves are
+        # merged. See enable_cpu_split / _forward_split.
+        self._cpu_split_enabled: bool = False
+        # Rolling per-step routed-set history that drives the lookahead
+        # reserve (see Prediction.record_step). None until offload is enabled
+        # and the engine wires one in (build_offload_cache).
+        self._predictor: Optional[Prediction] = None
+        # DeviceShuttle that carries token hidden-states to a remote GPU when a
+        # routed expert is resident on the other device (the three-way PCIe
+        # competition, traffic A). None on single-GPU / CPU boxes — the split
+        # path then has no remote transfer to account for.
+        self._shuttle: Optional["CpuShuttle"] = None
+        # Wall time of this layer's most recent step; _since_last_step_ms()
+        # turns the delta into the inter-forward window the predictor gets.
+        self._last_step_t: Optional[float] = None
+        # 熵感知自适应 top-k（默认关闭，from_config 会覆盖）
+        self.entropy_adaptive_k: bool = False
+        self.entropy_k_min: int = 2
+
+    # --------------------------------------------------------------- factories
+
+    @classmethod
+    def from_config(cls, cfg, dtype: Optional[torch.dtype] = None) -> "FusedMoE":
+        """Build from a ``reframework.models.ModelConfig`` (the models/ contract).
+
+        Pulls every geometry field out of the config so a DecoderLayer never
+        hardcodes expert dimensions; the engine passes ``cfg.dtype`` (or an
+        override) for the storage dtype.
+        """
+        moe = cls(
+            num_experts=cfg.num_experts,
+            top_k=cfg.num_experts_per_tok,
+            hidden_size=cfg.hidden_size,
+            intermediate_size=cfg.moe_inter,
+            activation=cfg.moe_activation,
+            renormalize=cfg.moe_renormalize,
+            dtype=dtype or cfg.dtype,
+        )
+        import os
+        _env_k = os.environ.get("RE_ENTROPY_K", "").lower() in {"1", "true", "yes", "on"}
+        moe.entropy_adaptive_k = bool(getattr(cfg, "entropy_adaptive_k", False)) or _env_k
+        moe.entropy_k_min = int(
+            os.environ.get("RE_ENTROPY_K_MIN")
+            or getattr(cfg, "entropy_k_min", 2)
+        )
+        import logging
+        logging.getLogger(__name__).info(
+            "[entropy] adaptive_k=%s k_min=%d top_k=%d num_experts=%d",
+            moe.entropy_adaptive_k, moe.entropy_k_min, moe.top_k, moe.num_experts,
+        )
+        return moe
+
+    # ------------------------------------------------------------ offload setup
+
+    def build_offload_cache(
+        self, device: torch.device, lru_capacity: int
+    ) -> ExpertOffloadCache:
+        """Stage this layer's experts into a pinned-host cache on ``device``."""
+        self._cache = ExpertOffloadCache(device=device, lru_capacity=lru_capacity, dtype=self.dtype)
+        experts: List[Dict[str, torch.Tensor]] = [
+            {"w1": self.experts_w1[e], "w2": self.experts_w2[e]}
+            for e in range(self.num_experts)
+        ]
+        self._cache.load(experts)
+        # 彻底释放原专家 ParameterList：把 ParameterList 替换成空的，
+        # nn.Module 的 _parameters 才会解引用旧 Parameter
+        self.experts_w1 = torch.nn.ParameterList()
+        self.experts_w2 = torch.nn.ParameterList()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return self._cache
+
+    def attach_predictor(self, window: int = 32) -> None:
+        """Enable the lookahead predictor for this layer.
+
+        Wires a :class:`Prediction` history buffer into the offload cache and
+        measures the host->VRAM bandwidth once. After that, every
+        ``forward`` feeds this step's routed set via
+        :meth:`Prediction.record_step`, which predicts the next step's
+        experts and pulls the top-k (dynamic k, bandwidth/LRU-bounded) into
+        the LRU during the inter-forward window. The engine calls this once
+        per offload layer when ``RE_MOE_PREDICT`` is on.
+        """
+        if self._cache is None:
+            return
+        self._cache.attach_predictor(window=window)
+        self._predictor = self._cache._predictor
+
+    def enable_cpu_split(self) -> None:
+        """Enable the CPU/GPU parallel expert split for this layer.
+
+        Builds the per-expert symmetric-int8 host bank in the offload cache
+        (so the CPU can compute miss experts without a PCIe round-trip) and
+        arms the parallel branch in :meth:`forward`. The engine calls this once
+        per offload layer when ``RE_MOE_CPU_SPLIT`` is on. No-op if the layer
+        is not offloaded, or if the CPU build is missing ``torch._int_mm``
+        (falls back to the pure-GPU prefetch path).
+        """
+        if self._cache is None:
+            return
+        if not hasattr(torch, "_int_mm"):
+            import logging
+            logging.getLogger(__name__).warning(
+                "CPU/GPU MoE split disabled: torch._int_mm unavailable"
+            )
+            return
+        self._cache.quantize_int8_host()
+        self._cpu_split_enabled = True
+
+    def set_shuttle(self, shuttle: Optional["CpuShuttle"]) -> None:
+        """Attach the :class:`DeviceShuttle` that carries token hidden-states
+        to a remote GPU (the three-way PCIe competition, traffic A).
+
+        When set, :meth:`_forward_split` records each step's token transfer on
+        the shuttle, and the predictor's next-step ``reserve`` deducts the
+        shuttle's :meth:`CpuShuttle.inflight_bytes` from its window budget —
+        the lookahead only reserves the PCIe bandwidth the token traffic has
+        not already consumed. ``None`` (the default) disables the accounting
+        entirely: the two-way baseline (pre-fetch vs on-demand). On a
+        single-GPU / CPU box there is no remote transfer, so no shuttle.
+        """
+        self._shuttle = shuttle
+
+    @property
+    def cpu_split(self) -> bool:
+        """True when the parallel split will be used by :meth:`forward`."""
+        return self._cpu_split_enabled and self.uses_offload and self._cache.cpu_split
+
+    def _since_last_step_ms(self) -> float:
+        """Measured inter-forward window in ms (time since this layer's
+        previous step); 0.0 on the very first step — the predictor then caps
+        by LRU room only."""
+        t = time.perf_counter()
+        if self._last_step_t is None:
+            return 0.0
+        dt_ms = max(0.0, (t - self._last_step_t) * 1000.0)
+        self._last_step_t = t
+        return dt_ms
+
+    @property
+    def uses_offload(self) -> bool:
+        return self._cache is not None
+
+    # ------------------------------------------------------------------- routing
+
+    def route(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (topk_weights [M,K] fp32, topk_ids [M,K] int64) for ``x``."""
+        import math
+        x2 = x.reshape(-1, self.hidden_size)
+        gate_out = F.linear(x2.to(self.dtype), self.gate.to(x2.device))
+
+        # 熵感知自适应 top-k：低熵 token 只用少量专家
+        if getattr(self, "entropy_adaptive_k", False):
+            probs = F.softmax(gate_out.float(), dim=-1)
+            H = -(probs * probs.clamp_min(1e-9).log()).sum(-1)
+            H_norm = H / math.log(self.num_experts)
+            k_dyn = (self.entropy_k_min +
+                     (self.top_k - self.entropy_k_min) * H_norm).round().long()
+            k_dyn = k_dyn.clamp(min=self.entropy_k_min, max=self.top_k)
+            top_w, top_idx = torch.topk(probs, self.top_k, dim=-1)
+            mask = (torch.arange(self.top_k, device=probs.device).unsqueeze(0)
+                    < k_dyn.unsqueeze(1))
+            # 权重：超出 k_dyn 的置 0
+            top_w = torch.where(mask, top_w, torch.zeros_like(top_w))
+            top_w = top_w / top_w.sum(-1, keepdim=True).clamp_min(1e-9)
+            # id 不替换，保留原始 topk 结果；超出 k_dyn 的位置权重为 0，
+            # 在 _forward_streaming 中会被过滤
+            return top_w, top_idx
+
+        return torch_fused_topk(gate_out, self.top_k, self.renormalize)
+
+    def prefetch_ids(self, x: torch.Tensor) -> torch.Tensor:
+        """Global expert ids the current token set routes to (for the engine to
+        prefetch *before* the forward pass, hiding PCIe latency)."""
+        _, topk_ids = self.route(x)
+        return topk_ids
+
+    # -------------------------------------------------------------------- banks
+
+    def _forward_streaming(
+        self, x, x2, topk_weights, topk_ids, dev,
+    ):
+        """分块加载专家并累加结果，不丢弃任何专家。
+
+        每个 chunk 只处理路由到该 chunk 中专家的 token，其他 token 完全跳过。
+        """
+        import os
+        chunk_size = int(os.environ.get("RE_CHUNK_SIZE", "8"))
+        M, K = topk_ids.shape  # [num_tokens, top_k]
+        num_experts = self.num_experts
+
+        # 收集所有唯一专家
+        ids_flat = topk_ids.reshape(-1).tolist()
+        uniq = sorted(set(int(i) for i in ids_flat if i >= 0))
+
+        out = torch.zeros_like(x2, dtype=torch.float32)
+
+        for i in range(0, len(uniq), chunk_size):
+            chunk = uniq[i:i + chunk_size]
+            w1, w2, local_index = self._cache.prefetch(chunk)
+
+            # 构造全局 -> 本地映射（不在块内的专家映射到 -1）
+            remap = torch.full((num_experts,), -1, dtype=torch.long, device=dev)
+            for g, loc in local_index.items():
+                remap[g] = loc
+
+            # 找出所有属于当前 chunk 的 (token, k) 位置
+            chunk_t = torch.tensor(chunk, device=dev, dtype=topk_ids.dtype)
+            mask = torch.isin(topk_ids, chunk_t)  # [M, K]
+
+            if not mask.any():
+                del w1, w2
+                continue
+
+            # 只取属于当前 chunk 的 token 和 k
+            token_idx, k_idx = mask.nonzero(as_tuple=True)
+            selected_tokens = x2[token_idx]           # [num_selected, H]
+            selected_ids = topk_ids[token_idx, k_idx] # [num_selected]
+            selected_weights = topk_weights[token_idx, k_idx]  # [num_selected]
+
+            # 映射到本地索引
+            local_ids = remap[selected_ids]  # [num_selected]
+            # 确保索引有效且权重 > 0（熵感知替换后可能出现重复 id + 零权重）
+            valid = (local_ids >= 0) & (selected_weights > 0)
+            if not valid.any():
+                del w1, w2
+                continue
+            local_ids = local_ids[valid]
+            selected_weights = selected_weights[valid]
+            selected_tokens = selected_tokens[valid]
+
+            # 计算这些 token 在本地块上的输出
+            partial = fused_experts(
+                selected_tokens, w1, w2,
+                selected_weights.unsqueeze(-1),  # [num_selected, 1]
+                local_ids.unsqueeze(-1),          # [num_selected, 1]
+                self.activation,
+            )  # [num_selected, H]
+
+            # 累加到对应的 token 位置
+            out.index_add_(0, token_idx[valid], partial.to(torch.float32))
+            del w1, w2, partial
+
+        out = out.to(x2.dtype)
+        return (out.reshape(x.shape[:1] + (self.hidden_size,))
+                if x.dim() > 1 else out)
+
+    def _banks(
+        self, topk_ids: torch.Tensor, topk_weights: torch.Tensor, dev: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, int]]:
+        """Packed expert banks + global->local index map for ``fused_experts``."""
+        if self.uses_offload:
+            assert self._cache is not None
+            import os
+            ids = topk_ids.reshape(-1).tolist()
+            max_pack = int(os.environ.get("RE_MAX_PACK", "2"))
+            # 按路由权重总和排序，保留最重要的专家
+            weights_flat = topk_weights.reshape(-1).tolist()
+            from collections import defaultdict
+            weight_sum = defaultdict(float)
+            for eid, w in zip(ids, weights_flat):
+                if eid >= 0:
+                    weight_sum[eid] += w
+            uniq = [eid for eid, _ in sorted(weight_sum.items(),
+                                             key=lambda x: -x[1])]
+            if len(uniq) > max_pack:
+                uniq = uniq[:max_pack]
+            return self._cache.prefetch(uniq)
+        # resident: pack every expert (fine when all experts fit in VRAM)
+        w1 = torch.stack(list(self.experts_w1), dim=0).to(dev)  # [E,2I,H]
+        w2 = torch.stack(list(self.experts_w2), dim=0).to(dev)  # [E,H,I]
+        local_index = {e: e for e in range(self.num_experts)}
+        return w1, w2, local_index
+
+    # ------------------------------------------------------------------ forward
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M = x.shape[0] if x.dim() > 1 else x.numel()
+        x2 = x.reshape(-1, self.hidden_size)
+        dev = x2.device
+
+        topk_weights, topk_ids = self.route(x2)
+
+        # CPU/GPU parallel split: dispatch routed experts by LRU residency and
+        # compute the two halves on different devices in parallel.
+        if self.cpu_split:
+            return self._forward_split(x, x2, topk_weights, topk_ids)
+
+        # 流式模式：分块 pack，逐块累加，避免一次性堆叠所有专家
+        import os as _os
+        _chunk = int(_os.environ.get("RE_CHUNK_SIZE", "0"))
+        if self.uses_offload and _chunk > 0:
+            return self._forward_streaming(x, x2, topk_weights, topk_ids, dev)
+
+        # 分块流式累加：不丢弃专家，每块只堆叠 chunk_size 个专家
+        import os as _os
+        _chunk = int(_os.environ.get("RE_CHUNK_SIZE", "0"))
+        if self.uses_offload and _chunk > 0:
+            return self._forward_streaming(x, x2, topk_weights, topk_ids, dev)
+
+        w1, w2, local_index = self._banks(topk_ids, topk_weights, dev)
+
+        # 截断后，topk_ids 里可能有不在 local_index 中的专家（被丢弃的）。
+        # 将这些位置的权重置 0，id 替换为 local_index 中第一个有效 id。
+        if len(local_index) < self.num_experts:
+            valid_ids = torch.tensor(list(local_index.keys()),
+                                     device=topk_ids.device, dtype=topk_ids.dtype)
+            mask = torch.isin(topk_ids, valid_ids)
+            fallback_id = valid_ids[0].expand_as(topk_ids)
+            topk_ids = torch.where(mask, topk_ids, fallback_id)
+            topk_weights = torch.where(mask, topk_weights,
+                                       torch.zeros_like(topk_weights))
+            # 重新归一化权重（可选，保持总和为 1）
+            # topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True).clamp_min(1e-9)
+
+        # Lookahead: record this step's *global* routed set *after* the current
+        # step's experts are resident (via _banks -> prefetch). Then
+        # predict_next filters them out and reserve() pulls in the NEXT step's
+        # predicted non-resident experts — the actual lookahead. Recording
+        # before _banks would make the predictor "predict" the very experts
+        # we are about to load (they are still non-resident), so the reserved
+        # budget would be spent on the current step instead of the next one.
+        # Prefill (M>1 in the single-stream engine) resets the history instead
+        # of looking ahead.
+        if self._predictor is not None and self._cache is not None:
+            self._predictor.record_step(
+                topk_ids.reshape(-1).tolist(),
+                is_prefill=(M > 1),
+                forward_ms=self._since_last_step_ms(),
+            )
+
+        # remap global expert ids -> local bank rows (identity when resident)
+        if len(local_index) != self.num_experts:
+            remap = torch.zeros(self.num_experts, dtype=torch.long, device=dev)
+            for g, loc in local_index.items():
+                remap[g] = loc
+            topk_ids = remap[topk_ids]
+
+        out = fused_experts(x2, w1, w2, topk_weights, topk_ids, self.activation)
+        # Explicit release: the stacked banks are ~56 MB/layer and would
+        # otherwise stay alive until GC, accumulating ~1.3 GiB per forward.
+        del w1, w2, topk_weights, topk_ids, x2
+        if 'local_index' in locals():
+            del local_index
+        return out.reshape(x.shape[:1] + (self.hidden_size,)) if x.dim() > 1 else out
+
+    # ------------------------------------------------------- CPU/GPU parallel split
+
+    def _forward_split(
+        self,
+        x: torch.Tensor,
+        x2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """CPU/GPU expert split forward.
+
+        Dispatch the routed set by LRU residency (``split_prefetch``): the
+        *resident* ("hit") experts are packed into a GPU bank and computed on
+        the compute device while the *miss* experts are computed on the CPU
+        against the int8 host bank. The two halves run in parallel — the CPU
+        job is submitted to a shared worker thread (or a daemon thread on the
+        CPU-only dev box where there is no GPU to overlap with) *before* the
+        GPU GEMMs, then the CPU result is copied back and the halves are
+        summed. On a real GPU the CPU transfer+compute overlaps the GPU
+        expert loop; on a CPU-only box it degrades to a sequential but still
+        correct split (the test path).
+        """
+        cache = self._cache
+        assert cache is not None
+        dev = x2.device
+        use_cuda = torch.cuda.is_available() and dev.type == "cuda"
+
+        # Dispatch: hits -> GPU bank, misses -> CPU. The misses are reactively
+        # loaded into the LRU for the *next* step (see split_prefetch).
+        (w1, w2, gpu_local), miss_ids = cache.split_prefetch(
+            topk_ids.reshape(-1).tolist()
+        )
+
+        # Three-way PCIe competition (traffic A): when a routed expert is
+        # resident on a remote GPU, this step's token hidden-states must cross
+        # the shared link to reach it. Record the bytes on the shuttle so the
+        # predictor's *next* reserve() deducts them from its window budget —
+        # the token transfer is in flight now, and reserve() runs in the step
+        # that follows (semantic B), so it sees exactly these bytes still
+        # occupying the link. On a single-GPU / CPU box _shuttle is None and
+        # this is a no-op (the two-way baseline).
+        if self._shuttle is not None:
+            self._shuttle.send(x2)
+
+        # Remap: full [num_experts] id -> local row, with misses mapped to
+        # -1 so the GPU's ``active`` mask (see below) excludes them.
+        remap = torch.full((self.num_experts,), -1, dtype=torch.long, device=dev)
+        for g, loc in gpu_local.items():
+            remap[g] = loc
+        topk_gpu = remap[topk_ids]  # [M,K]; -1 where the expert is a CPU miss
+
+        active_gpu = topk_gpu >= 0  # [M,K] bool — slots the GPU computes
+        # CPU-side ids: remap misses onto the int8 bank's local rows.
+        cpu_local = {i: k for k, i in enumerate(miss_ids)}
+        remap_cpu = torch.full((self.num_experts,), -1, dtype=torch.long, device=dev)
+        for g, loc in cpu_local.items():
+            remap_cpu[g] = loc
+        topk_cpu = remap_cpu[topk_ids]
+        active_cpu = topk_cpu >= 0  # [M,K] bool — slots the CPU computes
+
+        # ---- CPU half (submitted before the GPU work so they overlap) ----
+        w1q, w2q, s1, s2, _ = cache.cpu_banks(miss_ids)
+        cpu_input = (x2, w1q, w2q, s1, s2, topk_weights, topk_cpu, active_cpu)
+        # Shared worker pool on every device: on GPU the CPU GEMM (which holds
+        # no CUDA context) runs on the pool thread while the main thread drives
+        # the GPU expert loop; on a CPU-only box it is a plain second core.
+        fut = _cpu_executor().submit(fused_experts_cpu_int8, *cpu_input, self.activation)
+
+        # ---- GPU half ----
+        if bool(active_gpu.any()):
+            out = fused_experts_masked(
+                x2, w1, w2, topk_weights, topk_gpu.clamp_min(0),
+                active_gpu, self.activation,
+            )
+        else:
+            out = torch.zeros_like(x2)
+
+        # ---- join the CPU half and merge ----
+        cpu_out = fut.result()  # blocks until the CPU half finished
+        out = out.float() + cpu_out.to(dev, non_blocking=use_cuda)
+        out = out.to(x2.dtype)
+
+        # ---- reactive load: bring this step's misses resident for the NEXT
+        # step so they become GPU hits. Done after the merge so the HtoD copy
+        # lands in the inter-forward window (overlaps the next step's gate /
+        # other layers) instead of stalling this step's GPU compute.
+        cache.reactive_load(miss_ids)
+
+        # ---- lookahead: record this step's routed set after the split, so
+        # the predictor's next-step reserve sees the current set as resident.
+        if self._predictor is not None:
+            self._predictor.record_step(
+                topk_ids.reshape(-1).tolist(),
+                is_prefill=(x2.shape[0] > 1),
+                forward_ms=self._since_last_step_ms(),
+            )
+
+        del w1, w2, w1q, w2q, topk_gpu, topk_cpu
+        return out.reshape(x.shape[:1] + (self.hidden_size,)) if x.dim() > 1 else out
+
+    # --------------------------------------------------------------- (de)serial
+
+    def state_dict(self, *, prefix: str = "", result: Optional[dict] = None) -> Dict[str, torch.Tensor]:
+        result = {} if result is None else result
+        result[f"{prefix}.gate.weight" if prefix else "gate.weight"] = self.gate
+        I = self.intermediate_size
+        for e in range(self.num_experts):
+            p = f"{prefix}.experts.{e}" if prefix else f"experts.{e}"
+            # we store w1 fused as [2I,H] (gate|up); HF checkpoints keep them
+            # as two separate [I,H] tensors — split so names/shapes match 1:1.
+            result[f"{p}.gate_proj.weight"] = self.experts_w1[e][:I]
+            result[f"{p}.up_proj.weight"] = self.experts_w1[e][I:]
+            result[f"{p}.down_proj.weight"] = self.experts_w2[e]
+        return result
+
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], *, prefix: str = "") -> None:
+        with torch.no_grad():
+            g = f"{prefix}.gate.weight" if prefix else "gate.weight"
+            if g in state_dict:
+                self.gate.copy_(state_dict[g].detach().to(dtype=self.dtype))
+            I = self.intermediate_size
+            for e in range(self.num_experts):
+                p = f"{prefix}.experts.{e}" if prefix else f"experts.{e}"
+                # w1 is the fused gate|up bank; each HF half loads into its slice
+                for half, param in (
+                    ("gate_proj", self.experts_w1[e][:I]),
+                    ("up_proj", self.experts_w1[e][I:]),
+                    ("down_proj", self.experts_w2[e]),
+                ):
+                    key = f"{p}.{half}.weight"
+                    if key in state_dict:
+                        param.copy_(state_dict[key].detach().to(dtype=self.dtype))
+
+
+__all__ = ["FusedMoE"]

@@ -1,0 +1,215 @@
+"""Decoder block + base model (Llama/Qwen3 shared shape).
+
+One :class:`DecoderLayer` per transformer layer: pre-norm attention, pre-norm
+FFN — where the FFN is either a dense :class:`~reframework.layers.MLP` or a
+:class:`~reframework.moe.FusedMoE`, picked from the ``ModelConfig``.
+
+The MoE branch is the whole point of Re: on a 6-8 GB Pascal card a
+30B-A3B-class model only runs with its expert weights staged through
+``ExpertOffloadCache``. ``DecoderLayer`` knows nothing about that — it just
+builds a ``FusedMoE`` from the config; the engine later calls
+``moe_layer.build_offload_cache(device, lru_capacity)`` on every MoE layer with
+a capacity sized by ``ModelConfig.size_moe_lru``.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from reframework.core import Batch, get_global_ctx
+from reframework.layers import (
+    Linear,
+    MLP,
+    RMSNorm,
+    VocabParallelEmbedding,
+    ParallelLMHead,
+    get_rope,
+)
+from reframework.attention import AttentionSpec
+from reframework.moe import FusedMoE
+
+from .config import ModelConfig
+
+
+class Attention(nn.Module):
+    """QKV projection + RoPE + the configured attention backend."""
+
+    def __init__(self, cfg: ModelConfig, layer_id: int) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.layer_id = layer_id
+        h, d = cfg.hidden_size, cfg.head_dim
+        b = cfg.attention_bias
+        self.q_proj = Linear(h, cfg.num_qo_heads * d, bias=b)
+        self.k_proj = Linear(h, cfg.num_kv_heads * d, bias=b)
+        self.v_proj = Linear(h, cfg.num_kv_heads * d, bias=b)
+        self.o_proj = Linear(cfg.num_qo_heads * d, h, bias=b)
+        # rope_scaling is a tuple-of-pairs (hashable) -> safe for get_rope's @cache
+        # QK-Norm scope: per-head (default) or pre-head (OLMoE-style full-hidden).
+        norm_dim = cfg.qk_norm_size or cfg.head_dim
+        self.q_norm = RMSNorm(norm_dim, cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(norm_dim, cfg.rms_norm_eps)
+        self.qk_norm_pre_reshape = cfg.qk_norm_size > 0
+        self.rope = get_rope(
+            d,
+            d,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            cfg.rope_scaling,
+        )
+        self.spec = AttentionSpec(sliding_window=cfg.sliding_window)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        batch: Batch,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+        x = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states).view(-1, cfg.num_kv_heads, cfg.head_dim)
+
+        if self.qk_norm_pre_reshape:
+            # OLMoE-style: norm over the FULL q/k projection, then split heads.
+            x = self.q_norm(x)
+            k = self.k_norm(k)
+
+        x = x.view(-1, cfg.num_qo_heads, cfg.head_dim)
+        k = k.view(-1, cfg.num_kv_heads, cfg.head_dim)
+
+        if not self.qk_norm_pre_reshape:
+            x = self.q_norm(x)
+            k = self.k_norm(k)
+
+        q, k = self.rope(positions, x, k)
+        ctx = get_global_ctx()
+        out = ctx.attn_backend.forward(q, k, v, self.layer_id, batch, self.spec)
+        out = out.view(-1, cfg.num_qo_heads * cfg.head_dim)
+        return self.o_proj(out)
+
+
+class DecoderLayer(nn.Module):
+    """One pre-norm transformer layer; MoE or dense FFN per config."""
+
+    def __init__(self, cfg: ModelConfig, layer_id: int) -> None:
+        super().__init__()
+        nb = cfg.norm_bias
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, bias=nb)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, bias=nb)
+        self.self_attn = Attention(cfg, layer_id)
+        if cfg.has_moe:
+            from reframework.parallel.ep import ep_enabled, EPFusedMoE
+            from reframework.parallel import dist as _dist
+            if ep_enabled():
+                _ctx = _dist.current()
+                self.mlp = EPFusedMoE(cfg, ep_size=_ctx.ep_size,
+                                      ep_rank=_ctx.rank % _ctx.ep_size)
+            else:
+                self.mlp = FusedMoE.from_config(cfg)
+        else:
+            self.mlp = MLP(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                activation=cfg.moe_activation,
+            )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        batch: Batch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h, residual = self.input_layernorm.forward_add_residual(hidden_states, residual)
+        h = self.self_attn(positions, h, batch)
+        f, residual = self.post_attention_layernorm.forward_add_residual(h, residual)
+        f = self.mlp(f)
+        return f, residual
+
+
+class LlamaModel(nn.Module):
+    """Embedding + N decoder layers + final norm + LM head (returns logits).
+
+    ``state_dict``/``load_state_dict`` walk the sub-modules with HF-style
+    prefixes so a standard Qwen3/Llama checkpoint loads without a rename map.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, bias=cfg.norm_bias)
+        self.lm_head = ParallelLMHead(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            bias=False,
+            tie_word_embeddings=cfg.tie_word_embeddings,
+            tied_embedding=self.embed_tokens if cfg.tie_word_embeddings else None,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        batch: Batch,
+    ) -> torch.Tensor:
+        h = self.embed_tokens(input_ids)
+        residual = h
+        for layer in self.layers:
+            h, residual = layer(positions, h, residual, batch)
+
+        h, _ = self.norm.forward_add_residual(h, residual)
+        return self.lm_head(h)
+
+    # -------------------------------------------------------------- (de)serial
+    def state_dict(self) -> dict:
+        out: dict = {}
+        out.update(self.embed_tokens.state_dict(prefix="model.embed_tokens"))
+        for i, layer in enumerate(self.layers):
+            out.update(layer.input_layernorm.state_dict(prefix=f"model.layers.{i}.input_layernorm"))
+            attn = layer.self_attn
+            for part, mod in (
+                ("self_attn.q_proj", attn.q_proj),
+                ("self_attn.k_proj", attn.k_proj),
+                ("self_attn.v_proj", attn.v_proj),
+                ("self_attn.o_proj", attn.o_proj),
+                ("self_attn.q_norm", attn.q_norm),
+                ("self_attn.k_norm", attn.k_norm),
+            ):
+                out.update(mod.state_dict(prefix=f"model.layers.{i}.{part}"))
+            out.update(layer.post_attention_layernorm.state_dict(prefix=f"model.layers.{i}.post_attention_layernorm"))
+            # both FusedMoE and dense MLP expose HF-style names under "mlp"
+            out.update(layer.mlp.state_dict(prefix=f"model.layers.{i}.mlp"))
+        out.update(self.norm.state_dict(prefix="model.norm"))
+        out.update(self.lm_head.state_dict(prefix="lm_head"))
+        return out
+
+    def load_state_dict(self, sd: dict) -> None:
+        with torch.no_grad():
+            for i, layer in enumerate(self.layers):
+                prefix = f"model.layers.{i}"
+                layer.input_layernorm.load_state_dict(sd, prefix=f"{prefix}.input_layernorm")
+                attn = layer.self_attn
+                for part, mod in (
+                    ("self_attn.q_proj", attn.q_proj),
+                    ("self_attn.k_proj", attn.k_proj),
+                    ("self_attn.v_proj", attn.v_proj),
+                    ("self_attn.o_proj", attn.o_proj),
+                    ("self_attn.q_norm", attn.q_norm),
+                    ("self_attn.k_norm", attn.k_norm),
+                ):
+                    mod.load_state_dict(sd, prefix=f"{prefix}.{part}")
+                layer.post_attention_layernorm.load_state_dict(sd, prefix=f"{prefix}.post_attention_layernorm")
+                # both FusedMoE and dense MLP speak HF-style names under "mlp"
+                layer.mlp.load_state_dict(sd, prefix=f"{prefix}.mlp")
+            self.embed_tokens.load_state_dict(sd, prefix="model.embed_tokens")
+            self.norm.load_state_dict(sd, prefix="model.norm")
+            self.lm_head.load_state_dict(sd, prefix="lm_head")
+
+
+__all__ = ["Attention", "DecoderLayer", "LlamaModel"]

@@ -1,0 +1,18 @@
+# tiny-qwen3-moe: hidden=16, 2 layers, 8 experts, top_k=2
+# make_store accepts a directory and auto-finds model.safetensors
+model:
+  path: /home/samuel/Re/.hf/tiny-qwen3-moe
+compute:
+  dtype: fp16
+  device: cpu
+cache:
+  strategy: lru
+  max_experts: 8       # 8 experts x 2 layers; capacity 8 keeps all experts resident
+  predict_window: 32
+metrics:
+  log_activations: true
+  activations_file: data/activation_logs/tiny.jsonl
+  print_per_step: true
+prompt: ""
+max_new_tokens: 32
+seed: 42

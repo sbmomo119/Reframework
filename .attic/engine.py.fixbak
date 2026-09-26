@@ -1,0 +1,501 @@
+"""Minimal inference engine — single-stream, fp32, no CUDA graph, no offload.
+
+First-phase target: a dense Llama 3 8B (or any Llama-shaped checkpoint)
+running end-to-end on CPU or a Pascal GPU.
+
+Design notes (all deliberate, see env.py / utils/pascal.py):
+
+  * fp32 only — the layers upcast fp16 storage to fp32 math internally; the
+    engine never enables bf16/fp8 (Pascal has no tensor cores anyway).
+  * CUDA graph is OFF by default (``RE_ENABLE_CUDA_GRAPH``); this minimal
+    engine does not capture graphs at all — the paged-KV allocator hands out
+    fresh memory per request, which is graph-capture incompatible. Graph
+    support (if ever needed) belongs behind a pre-allocated slot pool.
+  * no raw CUDA API, no Triton — everything is portable torch; the sdpa
+    backend falls back to the math kernel on sm_61.
+
+Concurrency model: ``add_request`` queues a request, ``step()`` runs ONE
+forward pass (prefill for the youngest pending request, else decode for all
+in-flight requests), ``has_work()``/``stop_condition()`` let a CLI or server
+drive the loop. The later ``scheduler/`` package will replace the inline
+single-stream bookkeeping with continuous batching; this engine keeps the
+step() seam so that swap is mechanical.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Union
+
+import torch
+import torch.nn as nn
+
+from reframework.attention import create_attention_backend
+from reframework.core import AttnMetadata, Batch, Context, Req, SamplingParams, set_global_ctx
+from reframework.kvcache import CacheManager, create_kv_pool
+from reframework.scheduler import Action
+from reframework.utils.logging import init_logger
+
+logger = init_logger(__name__)
+
+__all__ = ["EngineConfig", "ReEngine"]
+
+
+@dataclass
+class EngineConfig:
+    """Runtime knobs (checkpoint-independent).
+
+    ``max_slots`` sizes the paged KV pool. Default: 8x ``max_seq_len`` —
+    plenty for a single-stream first phase; the scheduler phase will size it
+    from memory instead.
+    """
+
+    device: str = "auto"  # auto | cpu | cuda | cuda:<idx> (e.g. cuda:1)
+    dtype: torch.dtype = torch.float32  # fp32 only (constraint)
+    page_size: int = 1
+    max_slots: Optional[int] = None
+    max_seq_len: int = 4096
+    attn_backend: str = "sdpa"  # the only registered backend
+    enforce_eos: bool = True
+    use_scheduler: bool = False  # continuous batching via scheduler/ (opt-in)
+    max_num_seqs: int = 32  # scheduler cap on concurrently running requests
+    moe_offload: bool = True
+    lora_path: str | None = None
+    pp_size: int = 1
+    ep_size: int = 1
+    rank: int = 0
+    world_size: int = 1
+    master_addr: str = "127.0.0.1"
+    master_port: int = 29500
+    moe_cache_size: Optional[int] = None  # LRU expert slots; None -> env/auto
+
+    # ----------------------------------------------------------- device probe
+    def resolved_device(self) -> torch.device:
+        """Resolve the target device and validate it is actually usable.
+
+        ``auto`` prefers CUDA (device 0) when present, else CPU. Explicit
+        ``cuda``/``cuda:<idx>`` select that GPU and raise if it's absent (a
+        silent CPU fallback would hide a mis-configured multi-GPU run). The
+        probe also fills :attr:`caps` via :func:`reframework.utils.device_caps`
+        so the whole stack has one source of truth for what the card can do.
+        """
+        spec = (self.device or "auto").strip()
+        if spec in ("auto", ""):
+            if torch.cuda.is_available():
+                return self._cuda(0)
+            return torch.device("cpu")
+        if spec == "cpu":
+            return torch.device("cpu")
+        if spec == "cuda":
+            return self._cuda(0)
+        if spec.startswith("cuda:"):
+            try:
+                idx = int(spec.split(":", 1)[1])
+            except ValueError:
+                raise ValueError(f"bad device spec {self.device!r} (want auto|cpu|cuda|cuda:<idx>)")
+            return self._cuda(idx)
+        raise ValueError(f"unknown device spec {self.device!r}")
+
+    def _cuda(self, idx: int) -> torch.device:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"device 'cuda:{idx}' requested but torch.cuda is not available on this box"
+            )
+        n = torch.cuda.device_count()
+        if idx >= n:
+            raise RuntimeError(f"cuda:{idx} requested but only {n} GPU(s) present")
+        # probe capabilities (cached) so engine + layers share one source of truth
+        from reframework.utils.pascal import device_caps, pascal_warning_if_needed
+
+        self.caps = device_caps(idx)
+        warn = pascal_warning_if_needed(idx)
+        if warn:
+            logger.warning(warn)
+        return torch.device(f"cuda:{idx}")
+
+    @property
+    def caps(self):
+        """DeviceCaps for the resolved device (populated by :meth:`resolved_device`)."""
+        return getattr(self, "_caps", None)
+
+    @caps.setter
+    def caps(self, value):
+        self._caps = value
+
+
+class ReEngine:
+    """Single-stream inference engine over the Re model + paged KV cache."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        cfg: EngineConfig,
+        vocab_size: int,
+        eos_token_id: int = -1,
+    ) -> None:
+        self.model = model
+        self.ecfg = cfg
+        self.device = cfg.resolved_device()
+        self.vocab_size = vocab_size
+        self.eos_token_id = eos_token_id
+        self._reqs: List[Req] = []
+        self._pending: List[Req] = []  # admitted, not yet prefilled
+        self._seq_counter = 0
+
+        # KV pool + cache manager + attention backend.
+        max_slots = cfg.max_slots or cfg.max_seq_len * 8
+        pool = create_kv_pool(
+            num_layers=model.cfg.num_hidden_layers,
+            num_kv_heads=model.cfg.num_kv_heads,
+            head_dim=model.cfg.head_dim,
+            num_slots=max_slots,
+            dtype=cfg.dtype,
+            device=self.device,
+        )
+        ctx = Context(page_size=cfg.page_size)
+        ctx.kv_cache = pool
+        ctx.cache_manager = CacheManager(pool, self.device, cfg.page_size)
+        set_global_ctx(ctx)
+        ctx.attn_backend = create_attention_backend(cfg.attn_backend, model.cfg)
+        self.ctx = ctx
+
+        self._setup_moe_offload()
+        # --- LoRA adapter (opt-in) ---
+        if getattr(self.ecfg, 'lora_path', None):
+            from reframework import lora as _lora
+            lora_cfg = _lora.LoRAConfig()
+            wrapped = _lora.apply_lora(self.model, lora_cfg)
+            n = _lora.load_lora(self.model, self.ecfg.lora_path)
+            logger.info('LoRA adapter loaded: %s (%d layers wrapped, %d adapters)', self.ecfg.lora_path, len(wrapped), n)
+        self.model.to(self.device)
+
+        # Continuous-batching scheduler (opt-in). Owns the waiting/running
+        # split; KV side effects (row alloc / free) are delegated back to this
+        # engine through its callbacks, so the cache manager stays authoritative.
+        self.scheduler = None
+        if cfg.use_scheduler:
+            from reframework.scheduler import Scheduler
+
+            self.scheduler = Scheduler(
+                max_num_seqs=cfg.max_num_seqs,
+                available_tokens=lambda: self.ctx.cache_manager.available_tokens(),
+                on_admit=self._sched_admit,
+                on_preempt=self._sched_preempt,
+                on_finish=self._sched_finish,
+            )
+
+        logger.info(
+            "engine ready: device=%s dtype=%s layers=%d kv_slots=%d backend=%s cuda_graph=off scheduler=%s",
+            self.device,
+            cfg.dtype,
+            model.cfg.num_hidden_layers,
+            max_slots,
+            cfg.attn_backend,
+            "on" if self.scheduler is not None else "off",
+        )
+
+    # ------------------------------------------------------------ request API
+    def add_request(
+        self,
+        prompt_token_ids: List[int],
+        sampling_params: Optional[SamplingParams] = None,
+        rid: str = "",
+    ) -> str:
+        sp = sampling_params or SamplingParams()
+        req = Req(
+            rid=rid or f"seq-{self._seq_counter}",
+            origin_input_ids=list(prompt_token_ids),
+            sampling_params=sp,
+        )
+        self._seq_counter += 1
+        if req.len > self.ecfg.max_seq_len:
+            raise ValueError(f"prompt length {req.len} exceeds max_seq_len {self.ecfg.max_seq_len}")
+        if self.scheduler is not None:
+            self.scheduler.add_request(req)
+        else:
+            req.table_idx = self.ctx.cache_manager.admit_request()
+            self._pending.append(req)
+        return req.rid
+
+    def has_work(self) -> bool:
+        if self.scheduler is not None:
+            return self.scheduler.has_work()
+        return bool(self._pending or any(not r.finished for r in self._reqs))
+
+    def in_flight(self) -> List[Req]:
+        if self.scheduler is not None:
+            return list(self.scheduler.running)
+        return [r for r in self._reqs if not r.finished]
+
+    def get_request(self, rid: str) -> Optional[Req]:
+        if self.scheduler is not None:
+            for r in list(self.scheduler.waiting) + self.scheduler.running:
+                if r.rid == rid:
+                    return r
+            return None
+        return next((r for r in self._reqs + self._pending if r.rid == rid), None)
+
+    # ------------------------------------------------------------------ step
+    def step(self) -> List[torch.Tensor]:
+        """Run one forward pass. Without a scheduler: prefill the single pending
+        request, else decode all in-flight. With a scheduler: run whatever it
+        decided (prefill, decode, or idle)."""
+        if self.scheduler is not None:
+            return self._sched_step()
+        if self._pending:
+            return self._run_prefill()
+        active = self.in_flight()
+        if not active:
+            raise RuntimeError("step() with no in-flight request")
+        return self._run_decode(active)
+
+    def _sched_step(self) -> List[torch.Tensor]:
+        d = self.scheduler.schedule()
+        if d.action is Action.IDLE:
+            return []
+        return self._forward_pass(d.reqs, is_prefill=d.is_prefill)
+
+    def _run_prefill(self) -> List[torch.Tensor]:
+        # single-stream: the one pending request prefills its whole prompt.
+        req = self._pending.pop(0)
+        self._reqs.append(req)
+        req.extend_len = len(req.origin_input_ids)  # all_ids == origin for now
+        return self._forward_pass([req], is_prefill=True)
+
+    def _run_decode(self, active: List[Req]) -> List[torch.Tensor]:
+        for req in active:
+            req.extend_len = 1
+        return self._forward_pass(active, is_prefill=False)
+
+    def _forward_pass(self, reqs: List[Req], is_prefill: bool) -> List[torch.Tensor]:
+        """One model call over ``reqs``. The bookkeeping invariant: before the
+        pass each request has ``nc = len(all_ids) - extend_len`` tokens in the
+        KV cache, and ``extend_len`` fresh tokens (``all_ids[nc:]``) are
+        computed + written; after the pass ``num_computed += extend_len``."""
+        cm = self.ctx.cache_manager
+        for req in reqs:
+            req.num_computed_tokens = len(req.all_ids) - req.extend_len
+        slots = torch.cat([
+            cm.alloc_kv_slots(req.table_idx, req.extend_len) for req in reqs
+        ])
+        batch = Batch(
+            reqs=reqs,
+            is_prefill=is_prefill,
+            input_ids=torch.cat([
+                torch.tensor(req.all_ids[r.num_computed_tokens : r.num_computed_tokens + r.extend_len], dtype=torch.int64)
+                for r in reqs
+            ]).to(self.device),
+            attn_metadata=AttnMetadata.empty(is_prefill, int(sum(r.extend_len for r in reqs)), self.device),
+        )
+        self.ctx.batch = batch
+        self.ctx.attn_backend.prepare_metadata(batch)
+        batch.attn_metadata.out_cache_loc = slots
+
+        logits = self.model(batch.input_ids, batch.attn_metadata.positions, batch)
+        next_ids = self._sample_last(reqs, logits)
+        for req, nid in zip(reqs, next_ids):
+            req.num_computed_tokens += req.extend_len
+            req.output_ids.append(int(nid[0].item()))
+            self._check_finish(req, nid)
+        return next_ids
+
+    # -------------------------------------------------------------- sampling
+    @staticmethod
+    def _sample_last(reqs: List[Req], logits: torch.Tensor) -> List[torch.Tensor]:
+        # model returns only each request's last-position logits: [num_reqs, V]
+        out = []
+        for i, req in enumerate(reqs):
+            sp = req.sampling_params
+            row = logits[i]
+            if sp.is_greedy:
+                out.append(row.argmax().reshape(1))
+                continue
+            t = row / sp.temperature
+            if sp.top_k and 0 < sp.top_k < row.numel():
+                kth = torch.topk(row, sp.top_k).values[-1]
+                t = torch.where(row < kth, torch.full_like(t, float("-inf")), t)
+            if sp.top_p is not None and sp.top_p < 1.0:
+                sorted_vals, sorted_idx = torch.sort(t, descending=True)
+                cum = torch.cumsum(torch.softmax(sorted_vals, dim=-1), dim=-1)
+                keep = (cum - torch.softmax(sorted_vals, dim=-1)) <= sp.top_p
+                keep[-1] = True
+                t[~torch.scatter(
+                    torch.ones_like(t, dtype=torch.bool), 0, sorted_idx, keep
+                )] = float("-inf")
+            if sp.seed is not None:
+                g = torch.Generator()
+                g.manual_seed(sp.seed + req.num_computed_tokens)
+                out.append(torch.multinomial(torch.softmax(t, dim=-1), 1, generator=g))
+            else:
+                out.append(torch.multinomial(torch.softmax(t, dim=-1), 1))
+        return out
+
+    def _check_finish(self, req: Req, nid: torch.Tensor) -> None:
+        if req.finished:
+            return
+        tok = int(nid[0].item())
+        if self.ecfg.enforce_eos and self.eos_token_id >= 0 and tok == self.eos_token_id:
+            req.finished = True
+            req.finished_reason = "eos"
+        elif req.remaining_tokens() <= 0:
+            req.finished = True
+            req.finished_reason = "length"
+
+    def finish(self, req: Req) -> None:
+        """Free a request's KV (call once it is consumed)."""
+        if req.table_idx >= 0:
+            self.ctx.cache_manager.free_request(req.table_idx)
+            req.table_idx = -1
+        if req in self._reqs:
+            self._reqs.remove(req)
+
+    # ------------------------------------------- scheduler hooks (opt-in path)
+    def _sched_admit(self, req: Req) -> None:
+        # Allocate a fresh page-table row at prefill time. The Req object is the
+        # source of truth (table_idx); the scheduler owns waiting/running, so
+        # self._reqs is not touched here (a preempted+re-admitted req must not
+        # be appended twice).
+        req.table_idx = self.ctx.cache_manager.admit_request()
+
+    def _sched_preempt(self, req: Req) -> None:
+        # Recompute preemption: free the victim's KV so the new request fits.
+        # The victim is re-admitted (fresh row) by _sched_admit on its retry.
+        if req.table_idx >= 0:
+            self.ctx.cache_manager.free_request(req.table_idx)
+            req.table_idx = -1
+        # reset computed progress so it re-prefills from scratch on retry
+        req.num_computed_tokens = 0
+        req.output_ids.clear()
+        req.finished = False
+        req.finished_reason = ""
+        req.extend_len = 0
+
+    def _sched_finish(self, req: Req) -> None:
+        if req.table_idx >= 0:
+            self.ctx.cache_manager.free_request(req.table_idx)
+            req.table_idx = -1
+
+    # ------------------------------------------------------- MoE host offload
+    def _setup_moe_offload(self) -> None:
+        """Stage MoE experts into a pinned-host LRU cache (per MoE layer).
+
+        The engine-side step the models/ contract delegates here: after the
+        weights are loaded and on-device, each MoE layer's ``FusedMoE`` gets an
+        :class:`ExpertOffloadCache` so only a small LRU window of experts is
+        resident instead of all of them. No-op for dense models.
+        """
+        self.moe_offload = []
+        mc = self.model.cfg
+        has_moe = getattr(mc, "has_moe", None)
+        if has_moe is None:
+            # fallback: 检查第一层 mlp 是否有 build_offload_cache
+            first_mlp = getattr(self.model.layers[0], "mlp", None)
+            has_moe = hasattr(first_mlp, "build_offload_cache")
+        if not has_moe or not self.ecfg.moe_offload:
+            return
+        from reframework import env  # local: keep engine import light
+
+        cap = self.ecfg.moe_cache_size
+        if cap is None:
+            cap = env.get_moe_cache_size()
+        if cap is None or cap <= 0:
+            cap = min(mc.num_experts, 8)  # default window: keep top-8 experts
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if hasattr(mlp, "build_offload_cache"):
+                self.moe_offload.append(mlp.build_offload_cache(self.device, cap))
+        if self.moe_offload:
+            logger.info(
+                "moe offload on: %d layer(s), lru_capacity=%d expert(s)",
+                len(self.moe_offload), cap,
+            )
+
+    def offload_report(self) -> str:
+        return " | ".join(c.report() for c in self.moe_offload) if self.moe_offload else ""
+
+    # ------------------------------------------------------- convenience API
+    def generate(
+        self,
+        prompt_token_ids: List[int],
+        sampling_params: Optional[SamplingParams] = None,
+        on_token: Optional[callable] = None,
+    ) -> List[int]:
+        """Synchronous single-request generate; returns generated token ids."""
+        sp = sampling_params or SamplingParams()
+        if sp.max_new_tokens <= 0:
+            return []
+        rid = self.add_request(prompt_token_ids, sp)
+        req = self.get_request(rid)
+        seen = len(req.output_ids)
+        while req is not None and not req.finished:
+            self.step()
+            fresh = req.output_ids[seen:]
+            if on_token:
+                for t in fresh:
+                    on_token(t)
+            seen = len(req.output_ids)
+            if not fresh:
+                # step made no progress (should not happen for a live req)
+                break
+        self.finish(req)
+        return list(req.output_ids)
+
+    def stats(self) -> str:
+        return self.ctx.cache_manager.stats()
+
+
+def build_engine(
+    ckpt_dir: Union[str, "pathlib.Path"],
+    *,
+    tokenizer=None,
+    cfg: Optional[EngineConfig] = None,
+    **engine_kwargs,
+) -> ReEngine:
+    """Load a checkpoint and wrap it in an :class:`ReEngine`.
+
+    ``tokenizer`` is optional here (the CLI passes it in for eos_token_id);
+    without one, EOS enforcement is disabled.
+    """
+    import pathlib
+
+    from reframework.checkpoint import load_model
+    from reframework.models import ModelConfig
+
+    ecfg = cfg or EngineConfig()
+    model, report = load_model(
+        pathlib.Path(ckpt_dir),
+        dtype=ecfg.dtype,
+        device="cpu",
+    )
+    model_cfg: ModelConfig = model.cfg
+
+    # --- PP+EP 分布式初始化（单卡时 world_size=1，跳过） ---
+    if getattr(ecfg, "world_size", 1) > 1:
+        import torch as _torch
+        from reframework.parallel import init as _pinit
+        from reframework.parallel.pp import shard_model_pp, pp_enabled
+        _pinit(
+            backend="nccl" if _torch.cuda.is_available() else "gloo",
+            init_method=f"tcp://{ecfg.master_addr}:{ecfg.master_port}",
+            rank=ecfg.rank,
+            world_size=ecfg.world_size,
+            pp_size=ecfg.pp_size,
+            ep_size=ecfg.ep_size,
+        )
+        if pp_enabled():
+            shard_model_pp(model, ecfg.pp_size, ecfg.rank % ecfg.pp_size)
+    eos = -1
+    if tokenizer is not None:
+        eos = getattr(tokenizer, "eos_token_id", None) or -1
+    eng = ReEngine(
+        model,
+        ecfg,
+        vocab_size=model_cfg.vocab_size,
+        eos_token_id=eos,
+        **engine_kwargs,
+    )
+    eng.load_report = report  # type: ignore[attr-defined]
+    return eng
+
+
+__all__ = ["EngineConfig", "ReEngine", "build_engine"]

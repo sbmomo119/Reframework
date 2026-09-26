@@ -1,0 +1,198 @@
+"""Fused MoE layer (gate + routed experts, Pascal-safe, offload-aware).
+
+FreeToken's MoE is a triton fused_moe + fused_topk pair. Re does the routing
+with ``torch_fused_topk`` and the expert compute with ``fused_experts`` (plain
+cuBLAS), both in :mod:`reframework.moe.fused`. The only thing this layer adds
+on top is *where the expert weights live*:
+
+  * **resident** — small models where all experts fit in VRAM; the per-expert
+    ``nn.Parameter`` tensors are used directly.
+  * **offload**  — big MoE models that don't fit; the weights are staged in a
+    pinned-host :class:`ExpertOffloadCache` and prefetched per step. This is
+    the mode that makes a 30B-A3B-class MoE run on a 6-8 GB 1070ti.
+
+The forward path is identical in both modes after a single branch: build the
+packed expert banks, remap the routed ids to the bank's local rows, and call
+``fused_experts``.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+
+from reframework.layers.base import BaseOP
+from reframework.moe.fused import fused_experts, torch_fused_topk
+from reframework.moe.offload_cache import ExpertOffloadCache
+
+
+class FusedMoE(BaseOP):
+    """A routed MoE block: ``gate`` (Linear) -> top-k -> per-expert GEMMs."""
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: str = "silu",
+        renormalize: bool = True,
+        dtype: torch.dtype = torch.float16,
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.activation = activation
+        self.renormalize = renormalize
+        self.dtype = dtype
+
+        # gate: a Linear(H -> E), weight is [E, H] (out, in). F.linear does x @ W^T -> [M, E].
+        # HF names this `gate.weight` with exactly that [num_experts, hidden] shape.
+        self.gate = torch.nn.Parameter(torch.empty(num_experts, hidden_size, dtype=dtype))
+
+        # per-expert weights, HF naming. [2I,H] gate|up and [H,I] down.
+        # nn.ParameterList (NOT a plain list) so nn.Module actually registers them:
+        # parameters()/.to(device)/state_dict() must see all 2E experts, otherwise
+        # on a real 1070ti they'd silently stay on the CPU.
+        self.experts_w1 = torch.nn.ParameterList([
+            torch.nn.Parameter(torch.empty(2 * intermediate_size, hidden_size, dtype=dtype))
+            for _ in range(num_experts)
+        ])
+        self.experts_w2 = torch.nn.ParameterList([
+            torch.nn.Parameter(torch.empty(hidden_size, intermediate_size, dtype=dtype))
+            for _ in range(num_experts)
+        ])
+
+        self._cache: Optional[ExpertOffloadCache] = None
+
+    # --------------------------------------------------------------- factories
+
+    @classmethod
+    def from_config(cls, cfg, dtype: Optional[torch.dtype] = None) -> "FusedMoE":
+        """Build from a ``reframework.models.ModelConfig`` (the models/ contract).
+
+        Pulls every geometry field out of the config so a DecoderLayer never
+        hardcodes expert dimensions; the engine passes ``cfg.dtype`` (or an
+        override) for the storage dtype.
+        """
+        return cls(
+            num_experts=cfg.num_experts,
+            top_k=cfg.num_experts_per_tok,
+            hidden_size=cfg.hidden_size,
+            intermediate_size=cfg.moe_inter,
+            activation=cfg.moe_activation,
+            renormalize=cfg.moe_renormalize,
+            dtype=dtype or cfg.dtype,
+        )
+
+    # ------------------------------------------------------------ offload setup
+
+    def build_offload_cache(
+        self, device: torch.device, lru_capacity: int
+    ) -> ExpertOffloadCache:
+        """Stage this layer's experts into a pinned-host cache on ``device``."""
+        self._cache = ExpertOffloadCache(device=device, lru_capacity=lru_capacity, dtype=self.dtype)
+        experts: List[Dict[str, torch.Tensor]] = [
+            {"w1": self.experts_w1[e], "w2": self.experts_w2[e]}
+            for e in range(self.num_experts)
+        ]
+        self._cache.load(experts)
+        # 彻底释放原始专家 ParameterList（nn.Module 才会解引用旧 Parameter）
+        self.experts_w1 = torch.nn.ParameterList()
+        self.experts_w2 = torch.nn.ParameterList()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return self._cache
+
+    @property
+    def uses_offload(self) -> bool:
+        return self._cache is not None
+
+    # ------------------------------------------------------------------- routing
+
+    def route(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (topk_weights [M,K] fp32, topk_ids [M,K] int64) for ``x``."""
+        x2 = x.reshape(-1, self.hidden_size)
+        gate_out = F.linear(x2.to(self.dtype), self.gate.to(x2.device))
+        return torch_fused_topk(gate_out, self.top_k, self.renormalize)
+
+    def prefetch_ids(self, x: torch.Tensor) -> torch.Tensor:
+        """Global expert ids the current token set routes to (for the engine to
+        prefetch *before* the forward pass, hiding PCIe latency)."""
+        _, topk_ids = self.route(x)
+        return topk_ids
+
+    # -------------------------------------------------------------------- banks
+
+    def _banks(
+        self, topk_ids: torch.Tensor, dev: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, int]]:
+        """Packed expert banks + global->local index map for ``fused_experts``."""
+        if self.uses_offload:
+            assert self._cache is not None
+            return self._cache.prefetch(topk_ids.reshape(-1).tolist())
+        # resident: pack every expert (fine when all experts fit in VRAM)
+        w1 = torch.stack(list(self.experts_w1), dim=0).to(dev)  # [E,2I,H]
+        w2 = torch.stack(list(self.experts_w2), dim=0).to(dev)  # [E,H,I]
+        local_index = {e: e for e in range(self.num_experts)}
+        return w1, w2, local_index
+
+    # ------------------------------------------------------------------ forward
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M = x.shape[0] if x.dim() > 1 else x.numel()
+        x2 = x.reshape(-1, self.hidden_size)
+        dev = x2.device
+
+        topk_weights, topk_ids = self.route(x2)
+        w1, w2, local_index = self._banks(topk_ids, dev)
+
+        # remap global expert ids -> local bank rows (identity when resident)
+        if len(local_index) != self.num_experts:
+            remap = torch.zeros(self.num_experts, dtype=torch.long, device=dev)
+            for g, loc in local_index.items():
+                remap[g] = loc
+            topk_ids = remap[topk_ids]
+
+        out = fused_experts(x2, w1, w2, topk_weights, topk_ids, self.activation)
+        return out.reshape(x.shape[:1] + (self.hidden_size,)) if x.dim() > 1 else out
+
+    # --------------------------------------------------------------- (de)serial
+
+    def state_dict(self, *, prefix: str = "", result: Optional[dict] = None) -> Dict[str, torch.Tensor]:
+        result = {} if result is None else result
+        result[f"{prefix}.gate.weight" if prefix else "gate.weight"] = self.gate
+        I = self.intermediate_size
+        for e in range(self.num_experts):
+            p = f"{prefix}.experts.{e}" if prefix else f"experts.{e}"
+            # we store w1 fused as [2I,H] (gate|up); HF checkpoints keep them
+            # as two separate [I,H] tensors — split so names/shapes match 1:1.
+            result[f"{p}.gate_proj.weight"] = self.experts_w1[e][:I]
+            result[f"{p}.up_proj.weight"] = self.experts_w1[e][I:]
+            result[f"{p}.down_proj.weight"] = self.experts_w2[e]
+        return result
+
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], *, prefix: str = "") -> None:
+        with torch.no_grad():
+            g = f"{prefix}.gate.weight" if prefix else "gate.weight"
+            if g in state_dict:
+                self.gate.copy_(state_dict[g].detach().to(dtype=self.dtype))
+            I = self.intermediate_size
+            for e in range(self.num_experts):
+                p = f"{prefix}.experts.{e}" if prefix else f"experts.{e}"
+                # w1 is the fused gate|up bank; each HF half loads into its slice
+                for half, param in (
+                    ("gate_proj", self.experts_w1[e][:I]),
+                    ("up_proj", self.experts_w1[e][I:]),
+                    ("down_proj", self.experts_w2[e]),
+                ):
+                    key = f"{p}.{half}.weight"
+                    if key in state_dict:
+                        param.copy_(state_dict[key].detach().to(dtype=self.dtype))
+
+
+__all__ = ["FusedMoE"]
